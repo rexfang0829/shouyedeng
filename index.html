@@ -121,6 +121,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--ember);outline-
       <p class="note" id="mpNote">WASD 或方向鍵移動，手機用左半邊螢幕拖曳。射擊是自動的。</p>
     </div>
     <div class="sect">
+      <h3>你的名字</h3>
+      <div class="row"><input id="nickInput" maxlength="16" placeholder="守夜人" style="text-transform:none;letter-spacing:0;font-family:var(--body)"></div>
+    </div>
+    <div class="sect">
       <h3>燈芯 <span class="num" id="wickText" style="color:var(--ember)">0</span>・永久強化</h3>
       <div class="perks" id="perks"></div>
     </div>
@@ -166,9 +170,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--ember);outline-
 </div>
 <div class="toast" id="toast" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 (() => {
 'use strict';
+// ---- Supabase (used when the page runs outside claude.ai, e.g. GitHub Pages) ----
+const SUPABASE_URL = '';
+const SUPABASE_KEY = '';
 // ================= constants =================
 const AW = 2000, AH = 1400;                    // arena size
 const CORE = { x: AW/2, y: AH/2, r: 36 };
@@ -220,6 +228,47 @@ let mode='menu';        // menu | lobby | game
 let solo=true;
 let profile={ best:0, games:0, kills:0, wicks:0, perks:{hp:0,dmg:0,mag:0} };
 let records=[]; let names={};
+let supa=null; let NET_SNAP_MS=100, NET_PRES_MS=66;
+let nick = ''; try { nick = localStorage.getItem('lantern-nick') || ''; } catch {}
+if (!nick) nick = '守夜人' + Math.floor(100+Math.random()*900);
+function peerName(p, i){ if (p.sameTab) return '你'; return (p.presence && p.presence.n) || (p.by && names[p.by]) || `燈靈 ${(i||0)+1}`; }
+
+// Supabase realtime adapter exposing the same calls the game uses on claude.ai rooms
+function supaLobby(client){
+  const myId = Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
+  return { async join(name){
+    const ch = client.channel('lantern-'+name, { config:{ broadcast:{ self:false }, presence:{ key:myId } } });
+    const pres = new Map(), handlers = {}, peerFns = [], live = new Set([myId]);
+    let mine = {}, cache = [], sendTimer = null, lastSend = 0;
+    const build = () => { cache = [...live].map(id => ({ peer:id, by:null, isMe:id===myId, sameTab:id===myId, kind:'viewer', guest:false,
+      presence: id===myId ? mine : (pres.get(id)?.p || {}) })); };
+    const changed = () => { build(); const c = { peers:cache, joined:[], left:[], updated:[] }; peerFns.forEach(f=>{ try{ f(c); }catch{} }); };
+    ch.on('presence', { event:'sync' }, () => {
+      const st = ch.presenceState(); live.clear(); live.add(myId); Object.keys(st).forEach(k=>live.add(k));
+      for (const k of [...pres.keys()]) if (!live.has(k)) pres.delete(k);
+      changed();
+    });
+    ch.on('broadcast', { event:'p' }, ({ payload }) => { if (!payload || !payload.from) return; const isNew = !pres.has(payload.from); pres.set(payload.from, { p:payload.d||{}, t:Date.now() }); live.add(payload.from); isNew ? changed() : build(); });
+    ch.on('broadcast', { event:'m' }, ({ payload }) => { if (!payload) return; (handlers[payload.topic]||[]).forEach(f=>{ try{ f({ topic:payload.topic, data:payload.d, peer:payload.from, by:null, isMe:false, sameTab:false, kind:'viewer', guest:false }); }catch{} }); });
+    await new Promise((res, rej) => { const to = setTimeout(()=>rej(new Error('timeout')), 10000);
+      ch.subscribe(status => { if (status==='SUBSCRIBED'){ clearTimeout(to); ch.track({ at:Date.now() }); res(); } else if (status==='CHANNEL_ERROR' || status==='TIMED_OUT'){ clearTimeout(to); rej(new Error(status)); } }); });
+    const sendPres = () => { lastSend = Date.now(); sendTimer = null; ch.send({ type:'broadcast', event:'p', payload:{ from:myId, d:mine } }).catch(()=>{}); };
+    const beat = setInterval(() => { if (Date.now()-lastSend > 1500) sendPres(); for (const [k,v] of pres) if (Date.now()-v.t > 8000 && !(k in ch.presenceState())) { pres.delete(k); live.delete(k); changed(); } }, 1000);
+    build();
+    return {
+      name,
+      peers: () => cache,
+      presence(patch){ mine = Object.assign({}, mine, patch); build(); const wait = NET_PRES_MS - (Date.now()-lastSend);
+        if (wait <= 0) sendPres(); else if (!sendTimer) sendTimer = setTimeout(sendPres, wait); return Promise.resolve(); },
+      emit(topic, d){ (handlers[topic]||[]).forEach(f=>{ try{ f({ topic, data:d, peer:myId, by:null, isMe:true, sameTab:true, kind:'viewer', guest:false }); }catch{} });
+        return ch.send({ type:'broadcast', event:'m', payload:{ topic, from:myId, d } }).then(()=>{}); },
+      on(topic, fn){ (handlers[topic] ||= []).push(fn); return () => { handlers[topic] = handlers[topic].filter(f=>f!==fn); }; },
+      onPeers(fn){ peerFns.push(fn); setTimeout(()=>fn({ peers:cache, joined:cache, left:[], updated:[] })); return () => { const i=peerFns.indexOf(fn); if(i>=0) peerFns.splice(i,1); }; },
+      connected: () => true,
+      async leave(){ clearInterval(beat); clearTimeout(sendTimer); try{ await client.removeChannel(ch); }catch{} },
+    };
+  } };
+}
 
 // ================= player (local) =================
 const me = { x:CORE.x+60, y:CORE.y, stats:BASE_STATS(), picks:0, color:COLORS[0], up:{} };
@@ -502,10 +551,10 @@ let lastPres = 0, lastSnap = 0, lastSnapRecv = 0, offRoom = [];
 function pushPresence(force){
   if (!room) return;
   const now = performance.now();
-  if (!force && now - lastPres < 66) return;
+  if (!force && now - lastPres < NET_PRES_MS) return;
   lastPres = now;
   const s = me.stats;
-  room.presence({ on: mode==='game', uid, c:me.color, x:Math.round(me.x), y:Math.round(me.y), h:me.heals||0,
+  room.presence({ on: mode==='game', uid, n:nick, c:me.color, x:Math.round(me.x), y:Math.round(me.y), h:me.heals||0,
     s:{ dmg:+s.dmg.toFixed(1), rate:+s.rate.toFixed(2), multi:s.multi, range:Math.round(s.range), speed:Math.round(s.speed), magnet:Math.round(s.magnet),
         orbit:s.orbit, blast:s.blast, chain:s.chain, frost:s.frost, hpMax:s.hpMax, regen:s.regen } }).catch(()=>{});
 }
@@ -537,7 +586,7 @@ async function joinRoom(name){
   offRoom.push(room.on('start', msg => { startMatch(); }, ()=>{}));
   $('roomName').textContent = name;
   mode = 'lobby';
-  room.presence({ lobby:true, on:false, uid, c:me.color }).catch(()=>{});
+  room.presence({ lobby:true, on:false, uid, n:nick, c:me.color }).catch(()=>{});
   showOnly('lobby'); renderLobby();
 }
 let lastHeard = null;
@@ -551,7 +600,7 @@ function renderLobby(){
   const list = $('lobbyList'); list.innerHTML='';
   const ps = room.peers().filter(p=>p.kind==='viewer');
   ps.forEach((p,i) => { const s = el('span'); const b = el('b'); b.style.background = (p.presence&&p.presence.c) || COLORS[i%COLORS.length];
-    s.append(b, el('span',null, p.sameTab ? '你' : (p.by && names[p.by]) || `燈靈 ${i+1}`)); if (p.presence && p.presence.on) s.append(el('span','note','守夜中')); list.append(s); });
+    s.append(b, el('span',null, peerName(p,i))); if (p.presence && p.presence.on) s.append(el('span','note','守夜中')); list.append(s); });
   const playing = ps.some(p=>p.presence && p.presence.on);
   $('lobbyNote').textContent = playing ? '有人正在守夜，按開始直接加入他們。' : `${ps.length} 人在房間。朋友輸入同一個房號就能加入，任何人按開始，全員一起開局。`;
   $('startBtn').firstChild.textContent = playing ? '加入守夜 ' : '開始守夜 ';
@@ -599,6 +648,7 @@ async function recordGame(S){
   if (newBest) toast('新紀錄！');
   saveProfile();
   if (db && uid){ try{ await db.doc('records/'+uid).set({ best:profile.best, kills:profile.kills, games:profile.games, at:Date.now() }); }catch{} }
+  if (supa){ try{ await supa.from('records').insert({ name:nick.slice(0,16), wave:S.w, kills:S.k, players:Math.max(1,Object.keys(S.P).length) }); loadSupaBoard(); }catch{} }
 }
 async function saveProfile(){
   try{ localStorage.setItem('lantern-profile', JSON.stringify(profile)); }catch{}
@@ -618,7 +668,12 @@ function renderBoard(){
   const box=$('board'); if (!records.length) return;
   box.innerHTML='';
   records.slice(0,8).forEach((r,i) => { const d=el('div'); if (r.id===uid) d.className='me';
-    d.append(el('i',null,String(i+1)), el('span',null, r.id===uid ? '你' : (names[r.id] || '守夜人')), el('span','num',`第 ${r.best} 波`), el('i',null,`${r.kills} 擊退`)); box.append(d); });
+    d.append(el('i',null,String(i+1)), el('span',null, r.id===uid ? '你' : (r.name || names[r.id] || '守夜人') + (r.players>1?` 等 ${r.players} 人`:'')), el('span','num',`第 ${r.best} 波`), el('i',null,`${r.kills} 擊退`)); box.append(d); });
+}
+async function loadSupaBoard(){
+  if (!supa) return;
+  try { const { data, error } = await supa.from('records').select('name,wave,kills,players').order('wave',{ascending:false}).order('kills',{ascending:false}).limit(10);
+    if (!error && data){ records = data.map((r,i)=>({ id:'s'+i, name:r.name, best:r.wave, kills:r.kills, players:r.players })); renderBoard(); } } catch {}
 }
 
 // ================= HUD =================
@@ -689,7 +744,7 @@ function draw(dt){
     const st = V && V.P[p.peer];
     drawSpirit(m.x, m.y, p.presence.c||'#fff', st && st[1], p.presence.s, t, st ? st[2] : 0);
     ctx.fillStyle='rgba(236,235,228,.75)'; ctx.font='12px "Noto Sans TC",sans-serif'; ctx.textAlign='center';
-    ctx.fillText((p.by && names[p.by]) || '隊友', m.x, m.y-26);
+    ctx.fillText(peerName(p), m.x, m.y-26);
   }
   // me
   const mine = V && V.P[myPeer];
@@ -752,7 +807,7 @@ function frame(now){
       // host applies its own state directly
       applySnap(S);
       netH.push(...S.H); netF.push(...S.F);
-      if (room && now - lastSnap > 100){ lastSnap = now;
+      if (room && now - lastSnap > NET_SNAP_MS){ lastSnap = now;
         S.H = netH.slice(-40); S.F = netF.slice(-20); netH = []; netF = [];
         room.emit('snap', packSnap(S)).catch(()=>{}); }
     }
@@ -775,7 +830,17 @@ renderMenu();
 requestAnimationFrame(frame);
 
 (async () => {
-  if (!window.claude?.use){ $('mpNote').textContent = '目前是離線版：在 claude.ai 開啟才能和朋友連線。WASD 或方向鍵移動，射擊是自動的。'; $('quickBtn').disabled = true; $('codeBtn').disabled = true; return; }
+  const nickEl = $('nickInput'); nickEl.value = nick;
+  nickEl.addEventListener('change', () => { nick = nickEl.value.trim().slice(0,16) || nick; nickEl.value = nick; try{ localStorage.setItem('lantern-nick', nick); }catch{} });
+  if (!window.claude?.use){
+    if (SUPABASE_URL && SUPABASE_KEY && window.supabase){
+      supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { realtime:{ params:{ eventsPerSecond:30 } } });
+      lobbyRoom = supaLobby(supa); NET_SNAP_MS = 150; NET_PRES_MS = 125;
+      loadSupaBoard();
+      return;
+    }
+    $('mpNote').textContent = '目前是離線版，只能單人遊玩。WASD 或方向鍵移動，射擊是自動的。'; $('quickBtn').disabled = true; $('codeBtn').disabled = true; return;
+  }
   const [d, u, r] = await Promise.all([claude.use('db'), claude.use('user'), claude.use('room')]);
   db = d; user = u; lobbyRoom = r;
   uid = user ? await user.id() : null;
