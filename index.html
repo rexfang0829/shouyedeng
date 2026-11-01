@@ -792,8 +792,13 @@ function drawSpirit(x,y,col,down,s,t,rev,isMe){
 
 // ================= main loop =================
 let last = performance.now();
-function frame(now){
-  let dt = Math.min(0.05, (now-last)/1000); last = now;
+let lastTick = 0;
+function frame(now){ tick(now); requestAnimationFrame(frame); }
+// when the tab is in the background rAF stops; keep the match (and host snapshots) running
+setInterval(() => { const n = performance.now(); if (n - lastTick > 250) tick(n); }, 100);
+function tick(now){
+  lastTick = now;
+  let dt = Math.min(0.1, (now-last)/1000); last = now;
   if (hitStop>0){ hitStop-=dt; dt*=0.15; }
   if (mode==='game'){
     moveMe(dt);
@@ -816,8 +821,7 @@ function frame(now){
       if (V.ph==='over' && $('over').hidden){ $('overWave').textContent = `撐到第 ${V.w} 波`; $('againNote').textContent = solo ? '馬上開局' : '全員一起重開'; $('levelUp').hidden=true; pickOpen=false; $('over').hidden=false; recordGame(V); }
     }
   }
-  draw(dt);
-  requestAnimationFrame(frame);
+  if (document.visibilityState !== 'hidden') draw(dt);
 }
 function renderHudThrottled(dt){ hudT -= dt; if (hudT<=0){ hudT = 0.1; renderHud(); } }
 
